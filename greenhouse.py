@@ -5,6 +5,79 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 
+def solar_angles(start_date: dt.datetime, lat: float, lon: float):
+    """
+    Calculate the solar position every 6 minutes for a year at a location, starting on `start_date`.
+    """
+    assert -90 <= lat <= 90
+    assert -180 <= lon <= 180
+    
+    date = dt.date(start_date.year, start_date.month, start_date.day)
+    
+    tz = start_date.tzinfo
+    if tz is None:
+        time_shift = 0
+    else:
+        time_shift = tz.utcoffset(start_date).total_seconds() / 3600  # local time zone shift, in hours
+    julian_date = (date - dt.date(1900, 1, 1)).days /  + 2415018.5 - (time_shift / 24)
+
+    times = np.arange(1, 10 * 24 * 365 + 1, dtype=float) * 6 / 1440 # every 6 minutes, every day, for a year
+
+    timestamps = times + julian_date
+    julian_century = (timestamps - 2451545) / 36525
+    
+    geometric_mean_longitude_sun_deg = np.fmod(280.46646 + julian_century*(36000.76983 + julian_century * 0.0003032), 360.0)
+    geometric_mean_anomaly_sun_deg = 357.52911 + julian_century * (35999.05029 - 0.0001537 * julian_century)
+    earth_orbit_eccentricity = 0.016708634 - julian_century * (0.000042037 + 0.0000001267 * julian_century)
+    sun_equation_of_center = (
+        np.sin(np.deg2rad(geometric_mean_anomaly_sun_deg)) * (
+            1.914602 - julian_century * (0.004817 + 0.000014 * julian_century)
+        ) + np.sin(np.deg2rad(2 * geometric_mean_anomaly_sun_deg)) * (
+            0.019993 - 0.000101 * julian_century
+        ) + np.sin(np.deg2rad(3 * geometric_mean_anomaly_sun_deg)) * 0.000289
+    )
+    sun_true_longitude_deg = geometric_mean_longitude_sun_deg + sun_equation_of_center
+    sun_true_anomaly_deg = geometric_mean_anomaly_sun_deg + sun_equation_of_center
+    sun_rad_vector_au = (1.000001018 * (1 - earth_orbit_eccentricity * earth_orbit_eccentricity)) / (1 + earth_orbit_eccentricity * np.cos(np.deg2rad(sun_true_anomaly_deg)))
+    sun_apparent_long_deg = sun_true_longitude_deg - 0.00569 - 0.00478 * np.sin(np.deg2rad(125.04 - 1937.136 * julian_century))
+    mean_oblique_ecliptic_deg = 23 + (26 + ((21.448 - julian_century * (46.815 + julian_century * (0.00059 - julian_century * 0.001813)))) / 60 ) / 60
+    oblique_correction_deg = mean_oblique_ecliptic_deg + 0.00256 * np.cos(np.deg2rad(125.04 - 1934.136 * julian_century))
+    sun_right_ascension_deg = np.rad2deg(np.arctan2(np.cos(np.deg2rad(sun_apparent_long_deg)), np.cos(np.deg2rad(oblique_correction_deg)) * np.sin(np.deg2rad(sun_apparent_long_deg))))
+    sun_declination_deg = np.rad2deg(np.arcsin(np.sin(np.deg2rad(oblique_correction_deg)) * np.sin(np.deg2rad(sun_apparent_long_deg))))
+    var_y = np.tan(np.deg2rad(oblique_correction_deg / 2.0)) * np.tan(np.deg2rad(oblique_correction_deg / 2.0))
+    eq_of_time_min = 4*np.rad2deg(var_y*np.sin(2*np.deg2rad(geometric_mean_longitude_sun_deg))-2*earth_orbit_eccentricity*np.sin(np.deg2rad(geometric_mean_anomaly_sun_deg))+4*earth_orbit_eccentricity*var_y*np.sin(np.deg2rad(geometric_mean_anomaly_sun_deg))*np.cos(2*np.deg2rad(geometric_mean_longitude_sun_deg))-0.5*var_y*var_y*np.sin(4*np.deg2rad(geometric_mean_longitude_sun_deg))-1.25*earth_orbit_eccentricity*earth_orbit_eccentricity*np.sin(2*np.deg2rad(geometric_mean_anomaly_sun_deg)))
+    ha_sunrise_deg = np.rad2deg(np.arccos(np.cos(np.deg2rad(90.833)) / (np.cos(np.deg2rad(lat)) * np.cos(np.deg2rad(sun_declination_deg))) - np.tan(np.deg2rad(lat)) * np.tan(np.deg2rad(sun_declination_deg))))
+    solar_noon_lst = (720 - 4 * lon - eq_of_time_min + time_shift * 60) / 1440
+    sunrise_time_lst = solar_noon_lst - ha_sunrise_deg * 4 / 1440
+    sunset_time_lst = solar_noon_lst + ha_sunrise_deg * 4 / 1440
+    sunrise_duration_min = 8 * ha_sunrise_deg
+
+    true_solar_time_min = np.fmod(np.fmod(times, 1.0) * 1440 + eq_of_time_min + 4 * lon - 60 * time_shift, 1440.0)
+    hour_angle_deg = np.zeros(true_solar_time_min.shape, dtype=float)
+    mask = true_solar_time_min / 4 < 0
+    hour_angle_deg[mask] = true_solar_time_min[mask] / 4 + 180.0
+    hour_angle_deg[~mask] = true_solar_time_min[~mask] / 4 - 180.0
+    solar_zenith_angle_deg = np.rad2deg(np.arccos(np.sin(np.deg2rad(lat)) * np.sin(np.deg2rad(sun_declination_deg)) + np.cos(np.deg2rad(lat)) * np.cos(np.deg2rad(sun_declination_deg)) * np.cos(np.deg2rad(hour_angle_deg))))
+    solar_elevation_angle_deg = 90.0 - solar_zenith_angle_deg
+    
+    atmospheric_refraction_deg = np.zeros(solar_elevation_angle_deg.shape, dtype=float)
+    low_elv_mask = np.logical_and(solar_elevation_angle_deg > 5.0, solar_elevation_angle_deg < 85.0)
+    atmospheric_refraction_deg[low_elv_mask] = 58.1 / np.tan(np.deg2rad(solar_elevation_angle_deg[low_elv_mask])) - 0.07 / np.power(np.tan(np.deg2rad(solar_elevation_angle_deg[low_elv_mask])), 3) + 0.000086 / np.power(np.tan(np.deg2rad(solar_elevation_angle_deg[low_elv_mask])), 5)
+    near_horizon_mask = np.logical_and(solar_elevation_angle_deg > -0.575, solar_elevation_angle_deg < 5.0)
+    atmospheric_refraction_deg[near_horizon_mask] = 1735 + solar_elevation_angle_deg[near_horizon_mask] * (-518.2 + solar_elevation_angle_deg[near_horizon_mask]* (103.4 + solar_elevation_angle_deg[near_horizon_mask] * (-12.79 + solar_elevation_angle_deg[near_horizon_mask] * 0.711)))
+    atmospheric_refraction_deg[solar_elevation_angle_deg < -0.575] = -20.772 / np.tan(np.deg2rad(solar_elevation_angle_deg[solar_elevation_angle_deg < -0.575]))
+    atmospheric_refraction_deg /= 3600.0
+
+    solar_elv_corrected_deg = atmospheric_refraction_deg + solar_elevation_angle_deg
+    solar_az_deg = np.zeros(solar_elv_corrected_deg.shape, dtype=float)
+    mask = hour_angle_deg > 0.0
+    solar_az_deg[mask] = np.rad2deg(np.arccos(((np.sin(np.deg2rad(lat))*np.cos(np.deg2rad(solar_zenith_angle_deg[mask]))) - np.sin(np.deg2rad(sun_declination_deg[mask]))) / (np.cos(np.deg2rad(lat)) * np.sin(np.deg2rad(solar_zenith_angle_deg[mask]))))) + 180
+    solar_az_deg[~mask] = 540 - np.rad2deg(np.arccos(((np.sin(np.deg2rad(lat)) * np.cos(np.deg2rad(solar_zenith_angle_deg[~mask]))) - np.sin(np.deg2rad(sun_declination_deg[~mask]))) / (np.cos(np.deg2rad(lat)) * np.sin(np.deg2rad(solar_zenith_angle_deg[~mask])))))
+    solar_az_deg = np.fmod(solar_az_deg, 360.0)
+    
+    return solar_elv_corrected_deg, solar_az_deg
+
+
 def glazing_grid():
     """
     Defines the geometry of the glazing surface.
@@ -54,6 +127,9 @@ def solar_points():
     Gets the solar positions as an array of [South, East, Up] coordinates.
     """
     az_el = np.genfromtxt("solar_az_el.csv", skip_header=1, dtype=np.float32, delimiter=",")
+    el, az = solar_angles(dt.datetime(2025, 1, 1, tzinfo=dt.timezone(-dt.timedelta(hours=6))), 52.1093, -106.59)
+    assert np.allclose(az, az_el[:, 1]) is True, f"az doesn't match, max_diff {np.max(np.abs(np.rad2deg(np.angle(np.exp(1j * np.deg2rad(az - az_el[:, 1]))))))}"
+    assert np.allclose(el, az_el[:, 0]) is True, f"el doesn't match, max_diff {np.max(np.abs(el - az_el[:, 0]))}"
     new_points = np.zeros((az_el.shape[0], 3), dtype=np.float32)
     new_points[:, 0] = -np.cos(np.deg2rad(az_el[:, 1]))
     new_points[:, 1] = np.sin(np.deg2rad(az_el[:, 1]))
