@@ -19,7 +19,7 @@ def solar_angles(start_date: dt.datetime, lat: float, lon: float):
         time_shift = 0
     else:
         time_shift = tz.utcoffset(start_date).total_seconds() / 3600  # local time zone shift, in hours
-    julian_date = (date - dt.date(1900, 1, 1)).days /  + 2415018.5 - (time_shift / 24)
+    julian_date = (date - dt.date(1900, 1, 1)).days + 2 + 2415018.5 - (time_shift / 24)
 
     times = np.arange(1, 10 * 24 * 365 + 1, dtype=float) * 6 / 1440 # every 6 minutes, every day, for a year
 
@@ -126,14 +126,13 @@ def solar_points():
     """
     Gets the solar positions as an array of [South, East, Up] coordinates.
     """
-    az_el = np.genfromtxt("solar_az_el.csv", skip_header=1, dtype=np.float32, delimiter=",")
+    # az_el = np.genfromtxt("solar_az_el.csv", skip_header=1, dtype=np.float32, delimiter=",")
     el, az = solar_angles(dt.datetime(2025, 1, 1, tzinfo=dt.timezone(-dt.timedelta(hours=6))), 52.1093, -106.59)
-    assert np.allclose(az, az_el[:, 1]) is True, f"az doesn't match, max_diff {np.max(np.abs(np.rad2deg(np.angle(np.exp(1j * np.deg2rad(az - az_el[:, 1]))))))}"
-    assert np.allclose(el, az_el[:, 0]) is True, f"el doesn't match, max_diff {np.max(np.abs(el - az_el[:, 0]))}"
-    new_points = np.zeros((az_el.shape[0], 3), dtype=np.float32)
-    new_points[:, 0] = -np.cos(np.deg2rad(az_el[:, 1]))
-    new_points[:, 1] = np.sin(np.deg2rad(az_el[:, 1]))
-    new_points[:, 2] = np.sin(np.deg2rad(az_el[:, 0]))
+
+    new_points = np.zeros((el.shape[0], 3), dtype=np.float32)
+    new_points[:, 0] = -np.cos(np.deg2rad(az))
+    new_points[:, 1] = np.sin(np.deg2rad(az))
+    new_points[:, 2] = np.sin(np.deg2rad(el))
     norm = np.linalg.norm(new_points, axis=-1)
     return new_points / norm[:, np.newaxis]
 
@@ -178,6 +177,9 @@ def angle_with_zenith(points: np.ndarray):
 if __name__ == "__main__":
     sun_points = solar_points()
 
+    SQM_PER_SQIN = 0.0254 * 0.0254
+    SOLAR_FLUX_W_PER_SQM = 1000.0  # per wikipedia, at the surface on clear day at equator
+
     glazing_points, glazing_normal = glazing_grid()
     print(glazing_normal)
     roof_start, roof_end, roof_slope = roof_edge()
@@ -187,27 +189,32 @@ if __name__ == "__main__":
     for minute in range(0, 1440, 6):
         tstamps.append(dt.datetime(2025, 1, 1) + dt.timedelta(minutes=minute))
     
-    illuminated_cells = []
+    illuminated_sqm = []
+    adjusted_illuminated_area = []
     num_days = 365
     start_day = 0
     for i in range(start_day, start_day + num_days):
         solar_positions = sun_points[i*240 : (i+1)*240]
         sun_zenith_angles = angle_with_zenith(solar_positions)
+        sun_set = sun_zenith_angles > np.deg2rad(90.0)
+        is_sunlit = np.zeros((solar_positions.shape[0], glazing_points.shape[0]), dtype=bool)
+        is_sunlit[sun_set] = False
+        print(i, np.count_nonzero(~sun_set) * 6, " minutes of sunshine")
         sun_normals = sun_zenith_plane_normal(solar_positions)
         
-        glazing_sun_alignment = np.dot(solar_positions, glazing_normal)
+        glazing_sun_alignment = np.dot(solar_positions[~sun_set], glazing_normal)
         glazing_sun_alignment[glazing_sun_alignment < 0] = 0.0
          
-        roof_intersection_points = line_intersects_plane(adjusted_roof_start, roof_slope, solar_positions, sun_normals)
+        roof_intersection_points = line_intersects_plane(adjusted_roof_start, roof_slope, solar_positions[~sun_set], sun_normals[~sun_set])
         roof_zenith_angles = angle_with_zenith(roof_intersection_points)
-        print(roof_zenith_angles.shape)
+        # print(roof_zenith_angles.shape)
         no_intersections = np.nonzero(~np.isfinite(roof_intersection_points[..., 0]))  # calculate points where no intersection found
         intersection_past_end = np.nonzero(np.linalg.norm(roof_intersection_points, axis=-1) > np.linalg.norm(adjusted_roof_end, axis=-1))  # past the end of the roof line
         roof_zenith_angles[no_intersections] = np.pi / 2.0  # set to 90 degrees, only larger than sun angle if sun is set
         roof_zenith_angles[intersection_past_end] = np.pi / 2.0
-        roof_zenith_angles[solar_positions[:, 1] < 0] = np.pi / 2.0  # when sun is to the west (roof is east)
+        roof_zenith_angles[solar_positions[~sun_set, 1] < 0] = np.pi / 2.0  # when sun is to the west (roof is east)
 
-        is_sunlit = roof_zenith_angles > sun_zenith_angles[:, np.newaxis]
+        is_sunlit[~sun_set] = roof_zenith_angles > sun_zenith_angles[~sun_set, np.newaxis]
         #if i == start_day:
         #    fig, ax = plt.subplots(1, 1)
         #    ax.plot(np.rad2deg(np.arccos(glazing_sun_alignment)))
@@ -215,25 +222,38 @@ if __name__ == "__main__":
         #    ax.plot(np.rad2deg(sun_zenith_angles))
         #    plt.show()
         #    plt.close()
-        illuminated_cells.append(np.sum(is_sunlit, axis=1))
+        illuminated_area = np.zeros(solar_positions.shape[0], dtype=float)
+        illuminated_area = np.sum(is_sunlit, axis=1) * SQM_PER_SQIN
+        adjusted_area = np.zeros(illuminated_area.shape)
+        adjusted_area[~sun_set] = illuminated_area[~sun_set] * glazing_sun_alignment
+        adjusted_illuminated_area.append(adjusted_area)
+        illuminated_sqm.append(illuminated_area)
     
-    SQM_PER_SQIN = 0.0254 * 0.0254
-    SOLAR_FLUX_W_PER_SQM = 1000.0  # per wikipedia, at the surface on clear day
-    
-    sqm_illuminated = np.array(illuminated_cells) * SQM_PER_SQIN
-    insolation = SOLAR_FLUX_W_PER_SQM * sqm_illuminated * glazing_sun_alignment[np.newaxis, :]
+    sqm_illuminated = np.array(illuminated_sqm)
+    adjusted_sqm_illuminated = np.array(adjusted_illuminated_area)
+    insolation = SOLAR_FLUX_W_PER_SQM * adjusted_sqm_illuminated
     daily_cumulative = np.sum(insolation, axis=1) * 360
 
-    fig, ax = plt.subplots(1, 2, width_ratios=[1, 0.2], sharey='all', figsize=(8, 6))
-    img = ax[0].imshow(insolation / 1000, origin='lower', aspect='auto', interpolation='none', extent=(tstamps[0], tstamps[-1], start_day + 0.5, start_day + num_days + 0.5))
-    fig.colorbar(img, ax=ax[0], label="Solar Power [kW]")
+    fig, ax = plt.subplots(1, 3, width_ratios=[1, 1, 0.2], 
+                           sharey='all', figsize=(15, 8))
+    # img = ax[0].imshow(insolation / 1000, origin='lower', aspect='auto', interpolation='none', extent=(tstamps[0], tstamps[-1], start_day + 0.5, start_day + num_days + 0.5))
+    # fig.colorbar(img, ax=ax[0], label="Solar Power [kW]")
+
+    img = ax[0].imshow(sqm_illuminated, origin='lower', aspect='auto', interpolation='none', extent=(tstamps[0], tstamps[-1], start_day + 0.5, start_day + num_days + 0.5))
+    fig.colorbar(img, ax=ax[0], label="Illuminated Area [m^2]")
+    
     ax[0].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax[0].set_ylabel("Day of Year")
     ax[0].set_xlabel("Time of Day")
-    ax[1].plot(daily_cumulative / 1e6, np.arange(start_day + 1, start_day + num_days+1))
-    ax[1].set_xlabel("Insolation [MJ]")
-    ax[1].set_xlim(0)
+    
+    img = ax[1].imshow(adjusted_sqm_illuminated, origin='lower', aspect='auto', interpolation='none', extent=(tstamps[0], tstamps[-1], start_day + 0.5, start_day + num_days + 0.5))
+    fig.colorbar(img, ax=ax[1], label="Adjusted Illuminated Area [m^2]")
+    ax[1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+    ax[2].plot(daily_cumulative / 1e6, np.arange(start_day + 1, start_day + num_days+1))
+    ax[2].set_xlabel("Insolation [MJ]")
+    ax[2].set_xlim(0)
     plt.savefig("solar_flux.png", bbox_inches='tight')
-    plt.show()
+    # plt.show()
     plt.close()
 
